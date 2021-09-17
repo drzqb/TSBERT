@@ -1,22 +1,21 @@
 '''
     基于SimCSE无监督的中文相似度模型
     endpoint建模方式，见 https://keras.io/examples/keras_recipes/endpoint_layer_pattern/
+    训练模型和推理模型统一
 '''
 import tensorflow as tf
 from tensorflow.keras.layers import Input, Layer, Dense, Embedding, LayerNormalization, Dropout
 from tensorflow.keras.losses import categorical_crossentropy
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from transformers import BertTokenizer
-import pickle
 
 import os
 
 from FuncUtils import gelu, softmax, create_initializer, checkpoint_loader, get_cos_distance
 
-from TFDataUtils import single_example_parser_SimCSE_endpoint, batched_data
-
-PARAMS_bert_path = "pretrained/chinese_roberta_wwm_ext_L-12_H-768_A-12"
+from TFDataUtils import single_example_parser_SimCSE_endpoints, batched_data
 
 PARAMS_maxword = 512
 PARAMS_vocab_size = 21128
@@ -27,8 +26,8 @@ PARAMS_hidden_size = 768
 PARAMS_intermediate_size = 4 * 768
 PARAMS_batch_size = 16
 
-PARAMS_mode = "predict"
-PARAMS_epochs = 100
+PARAMS_mode = "train"
+PARAMS_epochs = 2
 PARAMS_lr = 1.0e-5
 
 PARAMS_train_file = [
@@ -36,58 +35,13 @@ PARAMS_train_file = [
 ]
 
 PARAMS_dev_file = [
-    'data/TFRecordFiles/lcqmc_test.tfrecord',
+    'data/TFRecordFiles/simcse_dev_lcqmc.tfrecord',
 ]
 
-PARAMS_model = "SimCSE_lcqmc_endpoint_randomini"
+PARAMS_model = "SimCSE_lcqmc_endpoints_randomini"
 PARAMS_check = "modelfiles/" + PARAMS_model
 
 PARAMS_drop_rate = 0.3
-
-
-def load_model_weights_from_checkpoint_bert(model, checkpoint_file):
-    """Load trained official modelfiles from checkpoint.
-
-    :param model: Built keras modelfiles.
-    :param checkpoint_file: The path to the checkpoint files, should end with '.ckpt'.
-    """
-    loader = checkpoint_loader(checkpoint_file)
-
-    weights = [
-        loader('bert/embeddings/position_embeddings'),
-        loader('bert/embeddings/word_embeddings'),
-        loader('bert/embeddings/token_type_embeddings'),
-        loader('bert/embeddings/LayerNorm/gamma'),
-        loader('bert/embeddings/LayerNorm/beta'),
-    ]
-    model.get_layer('embeddings').set_weights(weights)
-
-    weights_a = []
-    weights_f = []
-    for i in range(12):
-        pre = 'bert/encoder/layer_' + str(i) + '/'
-        weights_a.extend([
-            loader(pre + 'attention/self/query/kernel'),
-            loader(pre + 'attention/self/query/bias'),
-            loader(pre + 'attention/self/key/kernel'),
-            loader(pre + 'attention/self/key/bias'),
-            loader(pre + 'attention/self/value/kernel'),
-            loader(pre + 'attention/self/value/bias'),
-            loader(pre + 'attention/output/dense/kernel'),
-            loader(pre + 'attention/output/dense/bias'),
-            loader(pre + 'attention/output/LayerNorm/gamma'),
-            loader(pre + 'attention/output/LayerNorm/beta')])
-
-        weights_f.extend([
-            loader(pre + 'intermediate/dense/kernel'),
-            loader(pre + 'intermediate/dense/bias'),
-            loader(pre + 'output/dense/kernel'),
-            loader(pre + 'output/dense/bias'),
-            loader(pre + 'output/LayerNorm/gamma'),
-            loader(pre + 'output/LayerNorm/beta')])
-
-    weights = weights_a + weights_f
-    model.get_layer('encoder').set_weights(weights)
 
 
 class Aug(Layer):
@@ -95,18 +49,15 @@ class Aug(Layer):
         super(Aug, self).__init__(**kwargs)
 
     def call(self, inputs, **kwargs):
-        if isinstance(inputs, tuple):  # predict stage
-            x, y = inputs
-            batchsize = tf.shape(x)[0]
-            lx = tf.shape(x)[1]
-            ly = tf.shape(y)[1]
-            lmax = tf.maximum(lx, ly)
-            xx = tf.concat([x, tf.zeros([batchsize, lmax - lx], tf.int32)], axis=-1)
-            yy = tf.concat([y, tf.zeros([batchsize, lmax - ly], tf.int32)], axis=-1)
+        x, y = inputs
+        batchsize = tf.shape(x)[0]
+        lx = tf.shape(x)[1]
+        ly = tf.shape(y)[1]
+        lmax = tf.maximum(lx, ly)
+        xx = tf.concat([x, tf.zeros([batchsize, lmax - lx], tf.int32)], axis=-1)
+        yy = tf.concat([y, tf.zeros([batchsize, lmax - ly], tf.int32)], axis=-1)
 
-            return tf.concat([xx, yy], axis=0)
-        else:  # train stage
-            return tf.tile(inputs, [2, 1])
+        return tf.concat([xx, yy], axis=0)
 
 
 class Mask(Layer):
@@ -286,7 +237,7 @@ class MyLoss(Layer):
         y_pred = tf.nn.l2_normalize(inputs, axis=-1)
         y_pred, y_predplus = tf.split(y_pred, 2)
 
-        cos = get_cos_distance(y_pred, y_predplus)
+        cos = tf.reduce_sum(y_pred * y_predplus, axis=-1)
         cos = (1.0 + cos) / 2.0
 
         similarity = tf.matmul(y_pred, y_predplus, transpose_b=True)
@@ -306,6 +257,12 @@ class MyLoss(Layer):
 
 class CheckCallback(tf.keras.callbacks.Callback):
     def on_epoch_end(self, epoch, logs=None):
+        result = self.model.predict([sen2ida, sen2idb])
+        for i in range(len(sentencesa)):
+            print(sentencesa[i])
+            print(sentencesb[i])
+            print("相似度: ", result[i], "\n")
+
         self.model.save(PARAMS_check + "/SimCSE.h5")
 
 
@@ -313,32 +270,7 @@ class USER():
     def __init__(self):
         self.tokenizer = BertTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext")
 
-    def build_model_train(self):
-        sen = Input(shape=[None], name='sen', dtype=tf.int32)
-
-        now = Aug(name="aug")(sen)
-
-        mask, seqlen = Mask(name="mask")(now)
-
-        now = Embeddings(name="embeddings")(inputs=(now, seqlen))
-
-        now = Encoder(layers=12, name="encoder")(inputs=(now, mask))
-
-        now = CLSPool(name="clspool")(now)
-
-        cos = MyLoss(name="myloss")(now)
-
-        model = Model(inputs=sen, outputs=cos)
-
-        # tf.keras.utils.plot_model(model, to_file="SimCSE_train_unsupervised.jpg", show_shapes=True, dpi=900)
-
-        model.summary(line_length=200)
-        for tv in model.variables:
-            print(tv.name, tv.shape)
-
-        return model
-
-    def build_model_predict(self):
+    def build_model(self):
         sena = Input(shape=[None], name='sena', dtype=tf.int32)
         senb = Input(shape=[None], name='senb', dtype=tf.int32)
 
@@ -355,29 +287,39 @@ class USER():
         cos = MyLoss(name="myloss")(now)
 
         model = Model(inputs=[sena, senb], outputs=cos)
-        # tf.keras.utils.plot_model(model, to_file="SimCSE_predict_unsupervised.jpg", show_shapes=True, dpi=900)
 
         model.summary(line_length=200)
+
         for tv in model.variables:
             print(tv.name, tv.shape)
 
         return model
 
     def train(self):
-        model = self.build_model_train()
-
-        # load_model_weights_from_checkpoint_bert(model, PARAMS_bert_path + "/bert_model.ckpt")
+        model = self.build_model()
 
         optimizer = Adam(PARAMS_lr)
         model.compile(optimizer=optimizer)
 
-        model.save(PARAMS_check + '/SimCSE.h5')
-
         train_batch = batched_data(PARAMS_train_file,
-                                   single_example_parser_SimCSE_endpoint,
+                                   single_example_parser_SimCSE_endpoints,
                                    PARAMS_batch_size,
-                                   padded_shapes={"sen": [-1]})
+                                   padded_shapes={"sena": [-1], "senb": [-1]},
+                                   shuffle=False,
+                                   repeat=False)
+
+        # dev_batch = batched_data(PARAMS_dev_file,
+        #                          single_example_parser_SimCSE_endpoints,
+        #                          PARAMS_batch_size,
+        #                          padded_shapes={"sena": [-1], "senb": [-1]},
+        #                          shuffle=False,
+        #                          repeat=False)
+
         callbacks = [
+            # EarlyStopping(monitor='val_loss', patience=7),
+            # ModelCheckpoint(filepath=PARAMS_check + '/SimCSE.h5',
+            #                 monitor='val_loss',
+            #                 save_best_only=True),
             CheckCallback()
         ]
 
@@ -390,14 +332,12 @@ class USER():
         with open(PARAMS_check + "/history.txt", "w", encoding="utf-8") as fw:
             fw.write(str(history.history))
 
-    def predict(self, sentencesa, sentencesb):
-        sen2ida = self.tokenizer(sentencesa, padding=True, return_tensors="tf")["input_ids"]
-        sen2idb = self.tokenizer(sentencesb, padding=True, return_tensors="tf")["input_ids"]
-
-        model = self.build_model_predict()
+    def predict(self):
+        model = self.build_model()
         model.load_weights(PARAMS_check + "/SimCSE.h5", by_name=True)
 
-        result = model.predict([sen2ida, sen2idb])
+        result = model.predict({"sena": sen2ida, "senb": sen2idb})
+
         for i in range(len(sentencesa)):
             print(sentencesa[i])
             print(sentencesb[i])
@@ -408,20 +348,23 @@ if __name__ == "__main__":
     if not os.path.exists(PARAMS_check):
         os.makedirs(PARAMS_check)
     user = USER()
+    sentencesa = [
+        "微信号怎么二次修改",
+        "云赚钱怎么样",
+        "我喜欢北京",
+        "我喜欢晨跑",
+    ]
+    sentencesb = [
+        "怎么再二次修改微信号",
+        "怎么才能赚钱",
+        "我不喜欢北京",
+        "北京是中国的首都",
+    ]
+    sen2ida = user.tokenizer(sentencesa, padding=True, return_tensors="tf")["input_ids"]
+    sen2idb = user.tokenizer(sentencesb, padding=True, return_tensors="tf")["input_ids"]
 
     if PARAMS_mode.startswith('train'):
         user.train()
 
     elif PARAMS_mode == "predict":
-        user.predict([
-            "微信号怎么二次修改",
-            "云赚钱怎么样",
-            "我喜欢北京",
-            "我喜欢晨跑",
-        ],
-            [
-                "怎么再二次修改微信号",
-                "怎么才能赚钱",
-                "我不喜欢北京",
-                "北京是中国的首都",
-            ])
+        user.predict()

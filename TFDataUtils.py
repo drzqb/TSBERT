@@ -159,16 +159,10 @@ def sentence2tfrecord_SimCSE(tsvfile, tfrecordfile):
         next(f)
 
         for line in f:
-            if np.random.random() >= 0.05:
-                continue
-
             lines = line.lower().split("\t")
-            sena, senb = lines[0].strip(), lines[1].strip()
+            sena = lines[0].strip()
 
-            if np.random.random() < 0.5:
-                sen2id = tokenizer(sena)["input_ids"]
-            else:
-                sen2id = tokenizer(sena)["input_ids"]
+            sen2id = tokenizer(sena)["input_ids"]
 
             sen_feature = [tf.train.Feature(int64_list=tf.train.Int64List(value=[sen_])) for sen_ in
                            sen2id]
@@ -184,9 +178,6 @@ def sentence2tfrecord_SimCSE(tsvfile, tfrecordfile):
             num_example += 1
 
             print("\r num_example: %d" % (num_example), end="")  # train: 238766
-
-            if num_example == 10000:
-                break
 
 
 def single_example_parser_SimCSE(serialized_example):
@@ -217,7 +208,21 @@ def single_example_parser_SimCSE_endpoint(serialized_example):
     return {"sen": sen}
 
 
-def batched_data(tfrecord_filename, single_example_parser, batch_size, padded_shapes, shuffle=True):
+def single_example_parser_SimCSE_endpoints(serialized_example):
+    sequence_features = {
+        'sen': tf.io.FixedLenSequenceFeature([], tf.int64),
+    }
+
+    _, sequence_parsed = tf.io.parse_single_sequence_example(
+        serialized=serialized_example,
+        sequence_features=sequence_features
+    )
+
+    sen = sequence_parsed['sen']
+    return {"sena": sen, "senb": sen}
+
+
+def batched_data(tfrecord_filename, single_example_parser, batch_size, padded_shapes, shuffle=True, repeat=True):
     dataset = tf.data.TFRecordDataset(tfrecord_filename)
     if shuffle:
         dataset = dataset.shuffle(100 * batch_size)
@@ -226,17 +231,26 @@ def batched_data(tfrecord_filename, single_example_parser, batch_size, padded_sh
         .padded_batch(batch_size, padded_shapes=padded_shapes, drop_remainder=False) \
         .prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
 
+    if repeat:
+        dataset = dataset.repeat()
+
     return dataset
 
 
 if __name__ == "__main__":
     # sentence2tfrecord_SimCSE("data/OriginalFiles/lcqmc/lcqmc_train.tsv",
-    #                          "data/TFRecordFiles/simcse_train_lcqmc.tfrecord")
+    #                          "data/TFRecordFiles/simcse_train_lcqmc.tfrecord")    # 238766
+
+    # sentence2tfrecord_SimCSE("data/OriginalFiles/lcqmc/lcqmc_dev.tsv",
+    #                          "data/TFRecordFiles/simcse_dev_lcqmc.tfrecord")    # 8802
+
+    sentence2tfrecord_SimCSE("data/OriginalFiles/lcqmc/lcqmc_test.tsv",
+                             "data/TFRecordFiles/simcse_test_lcqmc.tfrecord")  # 12500
 
     # snli2txt("data/OriginalFiles/snli/cnsd_snli_v1.0.train.jsonl",
     #          "data/OriginalFiles/snli/cnsd_snli_v1.0.train.txt",
     #          "data/TFRecordFiles/cnsd_snli_v1.0.train.tfrecord",
     #          )
 
-    sentence2tfrecord_SBERT("data/OriginalFiles/lcqmc/lcqmc_dev.tsv",
-                            "data/TFRecordFiles/lcqmc_dev.tfrecord")
+    # sentence2tfrecord_SBERT("data/OriginalFiles/lcqmc/lcqmc_dev.tsv",
+    #                         "data/TFRecordFiles/lcqmc_dev.tfrecord")
