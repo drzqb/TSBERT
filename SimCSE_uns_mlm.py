@@ -2,10 +2,11 @@
     基于SimCSE无监督的中文相似度模型
     endpoint建模方式，见 https://keras.io/examples/keras_recipes/endpoint_layer_pattern/
     训练模型和推理模型统一
+    加入MLM任务
 '''
 import tensorflow as tf
 from tensorflow.keras.layers import Input, Layer, Dense, Embedding, LayerNormalization, Dropout
-from tensorflow.keras.losses import categorical_crossentropy
+from tensorflow.keras.losses import categorical_crossentropy, sparse_categorical_crossentropy
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
@@ -27,21 +28,33 @@ PARAMS_type_vocab_size = 2
 PARAMS_head = 12
 PARAMS_hidden_size = 768
 PARAMS_intermediate_size = 4 * 768
-PARAMS_batch_size = 16
+PARAMS_batch_size = 8
 
 PARAMS_mode = "train"
-PARAMS_epochs = 2
+PARAMS_epochs = 100
 PARAMS_lr = 1.0e-5
+PARAMS_lamda = 0.1
+PARAMS_steps_per_epoch = 1250
 
 PARAMS_train_file = [
-    'data/TFRecordFiles/lcqmc_train.tfrecord',
+    # 'data/TFRecordFiles/lcqmc_train.tfrecord',
+    'D:/pythonwork/SimpleLMTF1/simplelm/data/TFRecordFile/trainpyfc1_people0.tfrecord',
+    'D:/pythonwork/SimpleLMTF1/simplelm/data/TFRecordFile/trainpyfc1_people1.tfrecord',
+    'D:/pythonwork/SimpleLMTF1/simplelm/data/TFRecordFile/trainpyfc1_people2.tfrecord',
+    'D:/pythonwork/SimpleLMTF1/simplelm/data/TFRecordFile/trainpyfc1_people3.tfrecord',
+    'D:/pythonwork/SimpleLMTF1/simplelm/data/TFRecordFile/trainpyfc1_people4.tfrecord',
+    'D:/pythonwork/SimpleLMTF1/simplelm/data/TFRecordFile/trainpyfc1_people5.tfrecord',
+    'D:/pythonwork/SimpleLMTF1/simplelm/data/TFRecordFile/trainpyfc1_people6.tfrecord',
+    'D:/pythonwork/SimpleLMTF1/simplelm/data/TFRecordFile/trainpyfc1_people7.tfrecord',
+    'D:/pythonwork/SimpleLMTF1/simplelm/data/TFRecordFile/trainpyfc1_people8.tfrecord',
+    'D:/pythonwork/SimpleLMTF1/simplelm/data/TFRecordFile/trainpyfc1_people9.tfrecord',
 ]
 
 PARAMS_dev_file = [
     'data/TFRecordFiles/lcqmc_test.tfrecord',
 ]
 
-PARAMS_model = "SimCSE_lcqmc_endpoints"
+PARAMS_model = "SimCSE_lcqmc_mlm"
 PARAMS_check = "modelfiles/" + PARAMS_model
 
 PARAMS_drop_rate = 0.3
@@ -97,10 +110,23 @@ def load_model_weights_from_checkpoint_bert(model, checkpoint_file):
     # ]
     # model.get_layer('pooler').set_weights(weights)
 
+    weights = [
+        loader('cls/predictions/transform/dense/kernel'),
+        loader('cls/predictions/transform/dense/bias'),
+        loader('cls/predictions/transform/LayerNorm/gamma'),
+        loader('cls/predictions/transform/LayerNorm/beta')
+    ]
+    model.get_layer('sequence').set_weights(weights)
+
+    weights = [
+        loader('cls/predictions/output_bias'),
+    ]
+    model.get_layer('project').set_weights(weights)
+
 
 def single_example_parser_train(serialized_example):
     sequence_features = {
-        'sena': tf.io.FixedLenSequenceFeature([], tf.int64),
+        'sen': tf.io.FixedLenSequenceFeature([], tf.int64),
     }
 
     _, sequence_parsed = tf.io.parse_single_sequence_example(
@@ -108,7 +134,11 @@ def single_example_parser_train(serialized_example):
         sequence_features=sequence_features
     )
 
-    sen = sequence_parsed['sena']
+    sen = sequence_parsed['sen']
+
+    seqlen = tf.shape(sen)[0]
+
+    sen = tf.cond(tf.greater(seqlen, 100), lambda: sen[:100], lambda: sen)
 
     return {"sena": sen, "senb": sen}
 
@@ -157,12 +187,17 @@ class Mask(Layer):
     def __init__(self, **kwargs):
         super(Mask, self).__init__(**kwargs)
 
-    def call(self, senwrong, **kwargs):
-        sequencemask = tf.greater(senwrong, 0)
-        seq_length = tf.shape(senwrong)[1]
+    def call(self, sen, **kwargs):
+        sequencemask = tf.greater(sen, 0)
+        seq_length = tf.shape(sen)[1]
         mask = tf.tile(tf.expand_dims(sequencemask, axis=1), [PARAMS_head, seq_length, 1])
 
-        return mask, seq_length
+        mask_label = tf.less(tf.random.uniform(tf.shape(sen), 0.0, 1.0), 0.15)
+        mask_label = tf.logical_and(mask_label, sequencemask)
+
+        noise = tf.where(mask_label, 103 * tf.ones_like(sen), sen)
+
+        return mask, seq_length, tf.cast(mask_label, tf.float32), noise
 
 
 class Embeddings(Layer):
@@ -200,7 +235,7 @@ class Embeddings(Layer):
 
         all_embed = sen_embed + token_embed + pos_embed
 
-        return self.layernormanddrop(all_embed)
+        return self.layernormanddrop(all_embed), self.word_embeddings.embeddings
 
 
 class LayerNormalizeAndDrop(Layer):
@@ -322,12 +357,55 @@ class CLSAFTERPool(Layer):
         return self.dense(inputs[:, 0])
 
 
+class Sequence(Layer):
+    def __init__(self, **kwargs):
+        super(Sequence, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        self.transformer = Dense(PARAMS_hidden_size,
+                                 activation=gelu,
+                                 kernel_initializer=create_initializer(),
+                                 dtype=tf.float32,
+                                 name='transformer')
+        self.layernorm = LayerNormalization(name='layernormsuf', epsilon=1e-6)
+
+        super(Sequence, self).build(input_shape)
+
+    def call(self, inputs, **kwargs):
+        return self.layernorm(self.transformer(inputs))
+
+
+class Project(Layer):
+    def __init__(self, **kwargs):
+        super(Project, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        self.output_bias = self.add_weight(name="output_bias",
+                                           shape=[PARAMS_vocab_size],
+                                           dtype=tf.float32)
+
+    def call(self, inputs, **kwargs):
+        x, embedmatrix = inputs
+        return tf.einsum("ijk,lk->ijl", x, embedmatrix) + self.output_bias
+
+
 class MyLoss(Layer):
     def __init__(self, **kwargs):
         super(MyLoss, self).__init__(**kwargs)
 
     def call(self, inputs, **kwargs):
-        y_pred = tf.nn.l2_normalize(inputs, axis=-1)
+        pooloutput, projectoutput, senab, masklabel = inputs
+
+        sumls = tf.reduce_sum(masklabel)
+
+        loss = sparse_categorical_crossentropy(senab, projectoutput, from_logits=True)
+        loss *= masklabel
+
+        loss = tf.reduce_sum(loss) / sumls
+
+        self.add_loss(PARAMS_lamda * loss)
+
+        y_pred = tf.nn.l2_normalize(pooloutput, axis=-1)
         y_pred, y_predplus = tf.split(y_pred, 2)
 
         cos = tf.reduce_sum(y_pred * y_predplus, axis=-1)
@@ -343,6 +421,7 @@ class MyLoss(Layer):
         y_true = tf.tile(y_true, [2, 1])
 
         loss = tf.reduce_mean(categorical_crossentropy(y_true, similarity, from_logits=True))
+
         self.add_loss(loss)
 
         return cos
@@ -401,18 +480,25 @@ class USER():
         sena = Input(shape=[None], name='sena', dtype=tf.int32)
         senb = Input(shape=[None], name='senb', dtype=tf.int32)
 
-        now = Aug(name="aug")(inputs=(sena, senb))
+        senab = Aug(name="aug")(inputs=(sena, senb))
 
-        mask, seqlen = Mask(name="mask")(now)
+        mask, seqlen, masklabel, noise = Mask(name="mask")(senab)
 
-        sen_embed = Embeddings(name="embeddings")(inputs=(now, seqlen))
+        embeddings = Embeddings(name="embeddings")
+        noise_embed, embeddingmatrix = embeddings(inputs=(noise, seqlen))
+        senab_embed, _ = embeddings(inputs=(senab, seqlen))
 
-        now = Encoder(layers=12, name="encoder")(inputs=(sen_embed, mask))
+        encoder = Encoder(layers=12, name="encoder")
+        noisenow = encoder(inputs=(noise_embed, mask))
+        senabnow = encoder(inputs=(senab_embed, mask))
 
-        # now = CLSAFTERPool(name="pooler")(now)
-        now = CLSPool(name="pooler")(now)
+        pooloutput = CLSPool(name="pooler")(senabnow)
 
-        cos = MyLoss(name="myloss")(now)
+        sequenceoutput = Sequence(name="sequence")(noisenow)
+
+        projectoutput = Project(name="project")(inputs=(sequenceoutput, embeddingmatrix))
+
+        cos = MyLoss(name="myloss")(inputs=(pooloutput, projectoutput, senab, masklabel))
 
         model = Model(inputs=[sena, senb], outputs=cos)
 
@@ -422,6 +508,35 @@ class USER():
             print(tv.name, tv.shape)
 
         return model
+
+    # def build_model(self):
+    #     sena = Input(shape=[None], name='sena', dtype=tf.int32)
+    #     senb = Input(shape=[None], name='senb', dtype=tf.int32)
+    #
+    #     senab = Aug(name="aug")(inputs=(sena, senb))
+    #
+    #     mask, seqlen, masklabel, noise = Mask(name="mask")(senab)
+    #
+    #     sen_embed, embeddingmatrix = Embeddings(name="embeddings")(inputs=(noise, seqlen))
+    #
+    #     now = Encoder(layers=12, name="encoder")(inputs=(sen_embed, mask))
+    #
+    #     pooloutput = CLSPool(name="pooler")(now)
+    #
+    #     sequenceoutput = Sequence(name="sequence")(now)
+    #
+    #     projectoutput = Project(name="project")(inputs=(sequenceoutput, embeddingmatrix))
+    #
+    #     cos = MyLoss(name="myloss")(inputs=(pooloutput, projectoutput, senab, masklabel))
+    #
+    #     model = Model(inputs=[sena, senb], outputs=cos)
+    #
+    #     model.summary(line_length=200)
+    #
+    #     for tv in model.variables:
+    #         print(tv.name, tv.shape)
+    #
+    #     return model
 
     def train(self):
         model = self.build_model()
@@ -456,7 +571,7 @@ class USER():
         history = model.fit(
             train_batch,
             epochs=PARAMS_epochs,
-            steps_per_epoch=625,
+            steps_per_epoch=PARAMS_steps_per_epoch,
             callbacks=callbacks
         )
 
