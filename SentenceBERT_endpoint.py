@@ -1,6 +1,7 @@
 '''
     基于SentenceBERT的中文相似度模型
     简化bert调用
+    endpoint方式
 '''
 import tensorflow as tf
 from tensorflow.keras.layers import Input, Layer, Dense, Dropout
@@ -8,16 +9,18 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers.schedules import PolynomialDecay
 from official.nlp.optimization import WarmUp, AdamWeightDecay
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras.losses import BinaryCrossentropy
+from tensorflow.keras.losses import BinaryCrossentropy, binary_crossentropy
 from transformers import BertTokenizer, TFBertModel, BertConfig
+from scipy.stats import spearmanr
+import numpy as np
+
 from math import ceil
-import pickle
 
 import os
 
 from FuncUtils import get_cos_distance
 
-from TFDataUtils import single_example_parser_SBERT, batched_data
+from TFDataUtils import batched_data
 
 PARAMS_batch_size = 8
 
@@ -38,8 +41,36 @@ PARAMS_dev_file = [
     'data/TFRecordFiles/lcqmc_dev.tfrecord',
 ]
 
-PARAMS_model = "SBERT_lcqmc_simplified"
+PARAMS_test_file = [
+    'data/TFRecordFiles/lcqmc_test.tfrecord',
+]
+
+PARAMS_model = "SBERT_lcqmc_endpoint"
 PARAMS_check = "modelfiles/" + PARAMS_model
+
+
+def single_example_parser_SBERT(serialized_example):
+    sequence_features = {
+        'sena': tf.io.FixedLenSequenceFeature([], tf.int64),
+        'senb': tf.io.FixedLenSequenceFeature([], tf.int64),
+    }
+
+    context_features = {
+        "label": tf.io.FixedLenFeature([], tf.int64)
+    }
+
+    context_parsed, sequence_parsed = tf.io.parse_single_sequence_example(
+        serialized=serialized_example,
+        context_features=context_features,
+        sequence_features=sequence_features
+    )
+
+    sena = sequence_parsed['sena']
+    senb = sequence_parsed['senb']
+
+    label = context_parsed['label']
+
+    return {"sena": sena, "senb": senb, "label": label}
 
 
 class Aug(Layer):
@@ -69,7 +100,9 @@ class BERT(Layer):
         self.bert = TFBertModel.from_pretrained("hfl/chinese-roberta-wwm-ext", config=Config)
 
     def call(self, inputs, **kwargs):
-        return self.bert(inputs)[0]
+        return self.bert(input_ids=inputs,
+                         token_type_ids=tf.zeros_like(inputs),
+                         attention_mask=tf.cast(tf.greater(inputs, 0), tf.int32))[0]
 
 
 class GlobalAveragePool(Layer):
@@ -77,34 +110,82 @@ class GlobalAveragePool(Layer):
         super(GlobalAveragePool, self).__init__(**kwargs)
 
     def call(self, inputs, **kwargs):
-        seqenceouput_av = tf.reduce_mean(inputs, axis=1)
+        # seqenceouput_av = tf.reduce_mean(inputs, axis=1)
+        seqenceouput_av = inputs[:, 0]
 
         return seqenceouput_av
 
 
-class ProjectTrain(Layer):
+class Project(Layer):
     def __init__(self, **kwargs):
-        super(ProjectTrain, self).__init__(**kwargs)
+        super(Project, self).__init__(**kwargs)
 
+        self.lossobj = BinaryCrossentropy()
         self.projectdense = Dense(1, activation="sigmoid")
         self.dropout = Dropout(PARAMS_drop_rate)
 
     def call(self, inputs, **kwargs):
-        u, v = tf.split(inputs, 2)
+        uv, label = inputs
+        u, v = tf.split(uv, 2)
         fuse = tf.concat([u, v, tf.abs(u - v)], axis=-1)
         output = self.projectdense(self.dropout(fuse))
 
-        return output
+        predict = tf.cast(tf.greater(tf.squeeze(output, axis=-1), 0.5), tf.int32)
+
+        acc = tf.reduce_mean(tf.cast(tf.equal(predict, label), tf.float32))
+
+        self.add_metric(acc, name="acc")
+
+        loss = self.lossobj(label, output)
+
+        self.add_loss(loss)
+
+        cos = (1.0 + get_cos_distance(u, v)) / 2.0
+
+        return cos
 
 
-class ProjectPredict(Layer):
-    def __init__(self, **kwargs):
-        super(ProjectPredict, self).__init__(**kwargs)
+class CheckCallback(tf.keras.callbacks.Callback):
+    def __init__(self, validation):
+        super(CheckCallback, self).__init__()
 
-    def call(self, inputs, **kwargs):
-        u, v = tf.split(inputs, 2)
-        cos = get_cos_distance(u, v)
-        return (1.0 + cos) / 2.0
+        self.validation_data = validation
+
+    def on_train_begin(self, logs=None):
+        result = self.model.predict([sen2ida, sen2idb, tf.ones([tf.shape(sen2ida)[0]])])
+        for i in range(len(sentencesa)):
+            print(sentencesa[i])
+            print(sentencesb[i])
+            print("相似度: ", result[i], "\n")
+
+        predictions = []
+        labels = []
+        for data in self.validation_data:
+            res = self.model.predict(data)
+            predictions.extend(res)
+            labels.extend(data["label"].numpy())
+
+        spearmancoff = spearmanr(np.array(predictions), np.array(labels)).correlation
+
+        print("Spearman相关度: ", spearmancoff, "\n")
+
+    def on_epoch_end(self, epoch, logs=None):
+        result = self.model.predict([sen2ida, sen2idb, tf.ones([tf.shape(sen2ida)[0]])])
+        for i in range(len(sentencesa)):
+            print(sentencesa[i])
+            print(sentencesb[i])
+            print("相似度: ", result[i], "\n")
+
+        predictions = []
+        labels = []
+        for data in self.validation_data:
+            res = self.model.predict(data)
+            predictions.extend(res)
+            labels.extend(data["label"].numpy())
+
+        spearmancoff = spearmanr(np.array(predictions), np.array(labels)).correlation
+
+        print("Spearman相关度: ", spearmancoff, "\n")
 
 
 class USER():
@@ -114,6 +195,7 @@ class USER():
     def build_model(self):
         sena = Input(shape=[None], name='sena', dtype=tf.int32)
         senb = Input(shape=[None], name='senb', dtype=tf.int32)
+        label = Input(shape=[], name='label', dtype=tf.int32)
 
         now = Aug(name="aug")(inputs=(sena, senb))
 
@@ -121,16 +203,12 @@ class USER():
 
         now = GlobalAveragePool(name="globalaveragepool")(now)
 
-        if PARAMS_mode.startswith("train"):
-            logits = ProjectTrain(name="projecttrain")(now)
-            model = Model(inputs=[sena, senb], outputs=logits)
-            # tf.keras.utils.plot_model(model, to_file="SBERT_train_simplified.jpg", show_shapes=True, dpi=900)
-        else:
-            logits = ProjectPredict(name="projectpredict")(now)
-            model = Model(inputs=[sena, senb], outputs=logits)
-            # tf.keras.utils.plot_model(model, to_file="SBERT_predict_simplified.jpg", show_shapes=True, dpi=900)
+        cos = Project(name="project")(inputs=(now, label))
+
+        model = Model(inputs=[sena, senb, label], outputs=[cos])
 
         model.summary(line_length=200)
+
         for tv in model.variables:
             print(tv.name, tv.shape)
 
@@ -138,6 +216,7 @@ class USER():
 
     def train(self):
         model = self.build_model()
+
         if PARAMS_mode == 'train0':
             decay_schedule = PolynomialDecay(initial_learning_rate=PARAMS_lr,
                                              decay_steps=PARAMS_decay_steps,
@@ -162,25 +241,31 @@ class USER():
                                         epsilon=1.0e-6,
                                         exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
 
-        lossobj = BinaryCrossentropy()
-        model.compile(optimizer=optimizer, loss=lossobj, metrics=["acc"], )
-        model.save(PARAMS_check + '/SBERT.h5')
+        model.compile(optimizer=optimizer)
+
+        train_batch = batched_data(PARAMS_train_file,
+                                   single_example_parser_SBERT,
+                                   PARAMS_batch_size,
+                                   padded_shapes={"sena": [-1], "senb": [-1], "label": []},
+                                   shuffle=False, repeat=False)
+        dev_batch = batched_data(PARAMS_dev_file,
+                                 single_example_parser_SBERT,
+                                 PARAMS_batch_size,
+                                 padded_shapes={"sena": [-1], "senb": [-1], "label": []},
+                                 shuffle=False, repeat=False)
+        test_batch = batched_data(PARAMS_test_file,
+                                  single_example_parser_SBERT,
+                                  PARAMS_batch_size,
+                                  padded_shapes={"sena": [-1], "senb": [-1], "label": []},
+                                  shuffle=False, repeat=False)
 
         callbacks = [
             EarlyStopping(monitor='val_loss', patience=PARAMS_patience),
             ModelCheckpoint(filepath=PARAMS_check + '/SBERT.h5',
                             monitor='val_loss',
-                            save_best_only=True)
+                            save_best_only=True),
+            CheckCallback(validation=test_batch)
         ]
-
-        train_batch = batched_data(PARAMS_train_file,
-                                   single_example_parser_SBERT,
-                                   PARAMS_batch_size,
-                                   padded_shapes=(([-1], [-1]), []))
-        dev_batch = batched_data(PARAMS_dev_file,
-                                 single_example_parser_SBERT,
-                                 PARAMS_batch_size,
-                                 padded_shapes=(([-1], [-1]), []))
 
         history = model.fit(
             train_batch,
@@ -189,18 +274,15 @@ class USER():
             callbacks=callbacks
         )
 
-        file = open(PARAMS_check + '/history.pkl', 'wb')
-        pickle.dump(history.history, file)
-        file.close()
+        with open(PARAMS_check + "/history.txt", "w", encoding="utf-8") as fw:
+            fw.write(str(history.history))
 
-    def predict(self, sentencesa, sentencesb):
-        sen2ida = self.tokenizer(sentencesa, padding=True, return_tensors="tf")["input_ids"]
-        sen2idb = self.tokenizer(sentencesb, padding=True, return_tensors="tf")["input_ids"]
+    def predict(self):
 
         model = self.build_model()
         model.load_weights(PARAMS_check + "/SBERT.h5", by_name=True)
 
-        result = model.predict([sen2ida, sen2idb])
+        result = model.predict([sen2ida, sen2idb, tf.ones([tf.shape(sen2ida)[0]])])
 
         for i in range(len(sentencesa)):
             print(sentencesa[i])
@@ -213,18 +295,22 @@ if __name__ == "__main__":
         os.makedirs(PARAMS_check)
     user = USER()
 
+    sentencesa = [
+        "微信号怎么二次修改",
+        "云赚钱怎么样",
+        "我喜欢北京",
+        "我喜欢晨跑",
+    ]
+    sentencesb = [
+        "怎么再二次修改微信号",
+        "怎么才能赚钱",
+        "我不喜欢北京",
+        "北京是中国的首都",
+    ]
+    sen2ida = user.tokenizer(sentencesa, padding=True, return_tensors="tf")["input_ids"]
+    sen2idb = user.tokenizer(sentencesb, padding=True, return_tensors="tf")["input_ids"]
+
     if PARAMS_mode.startswith('train'):
         user.train()
     elif PARAMS_mode == "predict":
-        user.predict([
-            "微信号怎么二次修改",
-            "云赚钱怎么样",
-            "我喜欢北京",
-            "我喜欢晨跑",
-        ],
-            [
-                "怎么再二次修改微信号",
-                "怎么才能赚钱",
-                "我不喜欢北京",
-                "北京是中国的首都",
-            ])
+        user.predict()
