@@ -23,6 +23,10 @@
     论文：ConSERT: A Contrastive Framework for Self-Supervised Sentence Representation Transfer
     训练数据：同上
     
+    ESimCSE_unsupervised_endpoints: 采用与论文相同的损失函数
+    论文：ESimCSE: Enhanced Sample Building Method for Contrastive Learning of Unsupervised Sentence Embedding
+    训练数据：同上
+    
 ## 监督学习：双塔模型、对比学习
     
     SBERT：SentenceBERT
