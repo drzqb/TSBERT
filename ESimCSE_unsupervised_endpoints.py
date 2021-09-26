@@ -30,18 +30,18 @@ PARAMS_intermediate_size = 4 * 768
 PARAMS_batch_size = 16
 
 PARAMS_mode = "train"
-PARAMS_epochs = 2
+PARAMS_epochs = 10
 PARAMS_lr = 1.0e-5
 
 PARAMS_train_file = [
-    'data/TFRecordFiles/lcqmc_train.tfrecord',
+    'data/TFRecordFiles/cnsd-sts-train.tfrecord',
 ]
 
 PARAMS_dev_file = [
-    'data/TFRecordFiles/lcqmc_test.tfrecord',
+    'data/TFRecordFiles/cnsd-sts-test.tfrecord',
 ]
 
-PARAMS_model = "ESimCSE_lcqmc_endpoints"
+PARAMS_model = "ESimCSE_stsb_endpoints"
 PARAMS_check = "modelfiles/" + PARAMS_model
 
 PARAMS_drop_rate = 0.3
@@ -487,7 +487,7 @@ class USER():
         history = model.fit(
             train_batch,
             epochs=PARAMS_epochs,
-            steps_per_epoch=625,
+            # steps_per_epoch=625,
             callbacks=callbacks
         )
 

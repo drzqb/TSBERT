@@ -67,6 +67,46 @@ def snli2txt(jsonlfile, txtfile, tfrecordfile):
                     break
 
 
+def stsb2tfrecord(txtfile, tfrecordfile):
+    tokenizer = BertTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext")
+
+    writer = tf.io.TFRecordWriter(tfrecordfile)
+    num_example = 0
+
+    with open(txtfile, "r", encoding="utf-8") as fr:
+        for line in fr:
+            res = line.strip().split("||")
+
+            sena = res[1]
+            senb = res[2]
+            label = int(res[3])
+
+            sen2ida = tokenizer(sena)["input_ids"]
+            sen2idb = tokenizer(senb)["input_ids"]
+
+            sena_feature = [tf.train.Feature(int64_list=tf.train.Int64List(value=[sen_])) for sen_ in
+                            sen2ida]
+            senb_feature = [tf.train.Feature(int64_list=tf.train.Int64List(value=[sen_])) for sen_ in
+                            sen2idb]
+            label_feature = tf.train.Feature(int64_list=tf.train.Int64List(value=[label]))
+
+            seq_example = tf.train.SequenceExample(
+                feature_lists=tf.train.FeatureLists(feature_list={
+                    'sena': tf.train.FeatureList(feature=sena_feature),
+                    'senb': tf.train.FeatureList(feature=senb_feature),
+                }),
+                context=tf.train.Features(feature={
+                    'label': label_feature
+                }),
+            )
+
+            serialized = seq_example.SerializeToString()
+            writer.write(serialized)
+            num_example += 1
+
+            print("\r num_example: %d" % (num_example), end="")  # train: 238766
+
+
 def single_example_parser_SimCSE_snli(serialized_example):
     sequence_features = {
         'sen': tf.io.FixedLenSequenceFeature([], tf.int64),
@@ -244,8 +284,8 @@ if __name__ == "__main__":
     # sentence2tfrecord_SimCSE("data/OriginalFiles/lcqmc/lcqmc_dev.tsv",
     #                          "data/TFRecordFiles/simcse_dev_lcqmc.tfrecord")    # 8802
 
-    sentence2tfrecord_SimCSE("data/OriginalFiles/lcqmc/lcqmc_test.tsv",
-                             "data/TFRecordFiles/simcse_test_lcqmc.tfrecord")  # 12500
+    # sentence2tfrecord_SimCSE("data/OriginalFiles/lcqmc/lcqmc_test.tsv",
+    #                          "data/TFRecordFiles/simcse_test_lcqmc.tfrecord")  # 12500
 
     # snli2txt("data/OriginalFiles/snli/cnsd_snli_v1.0.train.jsonl",
     #          "data/OriginalFiles/snli/cnsd_snli_v1.0.train.txt",
@@ -254,3 +294,10 @@ if __name__ == "__main__":
 
     # sentence2tfrecord_SBERT("data/OriginalFiles/lcqmc/lcqmc_dev.tsv",
     #                         "data/TFRecordFiles/lcqmc_dev.tfrecord")
+
+    # stsb2tfrecord("data/OriginalFiles/STS-B/cnsd-sts-train.txt",
+    #               "data/TFRecordFiles/cnsd-sts-train.tfrecord")
+    # stsb2tfrecord("data/OriginalFiles/STS-B/cnsd-sts-dev.txt",
+    #               "data/TFRecordFiles/cnsd-sts-dev.tfrecord")
+    stsb2tfrecord("data/OriginalFiles/STS-B/cnsd-sts-test.txt",
+                  "data/TFRecordFiles/cnsd-sts-test.tfrecord")
