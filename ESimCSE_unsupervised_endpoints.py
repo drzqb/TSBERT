@@ -487,7 +487,7 @@ class USER():
         history = model.fit(
             train_batch,
             epochs=PARAMS_epochs,
-            # steps_per_epoch=625,
+            steps_per_epoch=625,
             callbacks=callbacks
         )
 
